@@ -5,7 +5,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import Quickshell
 import Quickshell.Io
-import qs.Commons
+import qs.Commons as Commons
 import "renderer/Geometry.js" as Position
 
 // Only settings and IPC run inside Omarchy. The worker owns every window.
@@ -30,8 +30,8 @@ Item {
     }
     readonly property string socketPath: Quickshell.env("XDG_RUNTIME_DIR")
         + "/desktop-top-" + Date.now() + "-" + Math.floor(Math.random() * 1000000) + ".sock"
-    readonly property var palette: ({foreground: String(Color.foreground), background: String(Color.background),
-        accent: String(Color.accent), fontFamily: Style.fontFamily})
+    readonly property var palette: ({foreground: String(Commons.Color.foreground), background: String(Commons.Color.background),
+        accent: String(Commons.Color.accent), fontFamily: Commons.Style.fontFamily})
 
     function configureWorker() {
         if (peer && peer.connected) peer.write(JSON.stringify({settings: settings, palette: palette}) + "\n");
@@ -127,7 +127,7 @@ Item {
         target: "desktop-top"
         function status(): string {
             return JSON.stringify(Object.assign({}, root.workerState, {
-                version: "0.1.3", renderer: "isolated-software", workerPid: worker.processId,
+                version: "0.1.4", renderer: "isolated-software", workerPid: worker.processId,
                 connected: !!root.peer, positionX: Position.unit(root.settings.positionX, 0.64),
                 positionY: Position.unit(root.settings.positionY, 0.52),
                 accent: root.palette.accent, foreground: root.palette.foreground, background: root.palette.background

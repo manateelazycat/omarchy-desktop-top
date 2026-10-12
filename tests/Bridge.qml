@@ -4,7 +4,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
-import qs.Commons
+import qs.Commons as Commons
 
 ShellRoot {
     id: test
@@ -23,8 +23,12 @@ ShellRoot {
     }
     IpcHandler {
         target: "bridge-test"
-        function theme(): void { Color.accent = "#f7768e"; Color.foreground = "#eeeeee"; }
-        function info(): string { return JSON.stringify({writes: test.writes, state: test.service ? test.service.workerState : null}); }
+        function theme(): void { Commons.Color.accent = "#f7768e"; Commons.Color.foreground = "#eeeeee"; }
+        function info(): string {
+            return JSON.stringify({writes: test.writes, state: test.service ? test.service.workerState : null,
+                palette: {foreground: String(Commons.Color.foreground), background: String(Commons.Color.background),
+                    accent: String(Commons.Color.accent), fontFamily: Commons.Style.fontFamily}});
+        }
         function unload(): void { test.service.destroy(); test.service = null; }
         function quit(): void { Qt.quit(); }
     }

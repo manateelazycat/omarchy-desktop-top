@@ -65,7 +65,9 @@ def main():
             btop_pids = []
             try:
                 current = wait_until(lambda: (s if (s := status()).get('connected') and s.get('screens') else None))
-                assert current['version'] == '0.1.1'
+                assert current['version'] == json.loads((ROOT / 'manifest.json').read_text())['version']
+                expected_palette = json.loads(call('bridge-test', 'info'))['palette']
+                assert current['palette'] == expected_palette, (current['palette'], expected_palette)
                 assert current['positionX'] == 0.31 and current['positionY'] == 0.69
                 assert current['width'] == 1050 and current['height'] == 680
                 worker_pid = current['workerPid']
@@ -88,6 +90,7 @@ def main():
                 assert call('desktop-top', 'setSize', 'invalid', '-1').startswith('Size must')
                 call('bridge-test', 'theme')
                 wait_until(lambda: status().get('palette', {}).get('accent') == '#f7768e')
+                assert status()['palette']['foreground'] == '#eeeeee'
                 assert json.loads(call('bridge-test', 'info'))['writes'] == 2
                 time.sleep(0.5)
                 current = status()
