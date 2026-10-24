@@ -6,18 +6,27 @@
 //   g++ -std=c++17 -Wall -Wextra -Werror -o /tmp/csi_filter.test tests/csi_filter.test.cpp native/CsiFilter.cpp
 //   /tmp/csi_filter.test
 //
+// Add -DCSI_FILTER_WITH_VTERM and link libvterm to exercise the real parser;
+// link an ASan/UBSan build of libvterm to detect writes before its callbacks.
+//
 // The oracle below re-derives libvterm 0.3.3's argument accumulation
 // (src/parser.c lines 139-376) line by line: a raw over-long CSI must trip
 // it, and the filter's output must never trip it.
 
 #include "../native/CsiFilter.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
+
+#ifdef CSI_FILTER_WITH_VTERM
+#include <vterm.h>
+#endif
 
 // Models libvterm 0.3.3 with utf8 mode on, as the plugin configures it:
 // raw C1 bytes never reach the state machine, only ESC-hoisted ones do.
@@ -96,7 +105,7 @@ struct LibvtermMirror {
                 if (c == 0x07 || (c1_allowed && c == 0x9c)) { st = NORMAL; break; } // via 299
                 if (c >= '0' && c <= '9') break;
                 st = STRING; // 271-281
-                break;
+                [[fallthrough]];
             case STRING: // 294
                 if (c == 0x07 || (c1_allowed && c == 0x9c)) st = NORMAL;
                 break;
@@ -153,6 +162,54 @@ static void expect(const std::string &got, const std::string &want, const char *
     }
 }
 
+// Feeds the filtered bytes through the real libvterm parser. The callback
+// reports how many CSI arguments reached it: the parser only writes past its
+// fixed array when a separator arrives at argi == 15, after which the final
+// byte reports argcount > 16. Build libvterm with ASan to catch the write
+// itself rather than relying on this counter.
+#ifdef CSI_FILTER_WITH_VTERM
+struct CsiProbe {
+    int maxArgCount = 0;
+    int csiCount = 0;
+};
+
+static int probeCsi(const char *, const long *, int argcount, const char *, char, void *user) {
+    CsiProbe *probe = static_cast<CsiProbe *>(user);
+    if (argcount > probe->maxArgCount) probe->maxArgCount = argcount;
+    ++probe->csiCount;
+    return 1;
+}
+
+static void checkRealLibvterm(const std::string &filtered, const char *what) {
+    VTerm *vt = vterm_new(25, 80);
+    assert(vt);
+    vterm_set_utf8(vt, 1);
+    CsiProbe probe;
+    VTermParserCallbacks callbacks = {};
+    callbacks.csi = probeCsi;
+    vterm_parser_set_callbacks(vt, &callbacks, &probe);
+    vterm_input_write(vt, filtered.data(), filtered.size());
+    vterm_free(vt);
+    if (probe.maxArgCount > 16) {
+        std::fprintf(stderr, "FAIL %s: libvterm saw %d CSI arguments\n", what, probe.maxArgCount);
+        std::exit(1);
+    }
+}
+#endif
+
+static void checkSafe(const std::string &input, const char *what) {
+    const std::string out = filter(input);
+    LibvtermMirror m;
+    m.feed(out.data(), out.size());
+    if (m.oobWrites != 0) {
+        std::fprintf(stderr, "FAIL %s: filtered output still overflows\n", what);
+        std::exit(1);
+    }
+#ifdef CSI_FILTER_WITH_VTERM
+    checkRealLibvterm(out, what);
+#endif
+}
+
 int main() {
     // Sanity: the oracle must model the bug it guards against.
     {
@@ -174,6 +231,9 @@ int main() {
         "\xe8\xbf\x9b\xe7\xa8\x8b \xf0\x9f\x90\xa2 libre\xc3\xa9", // UTF-8 text
         "\x1b[?;5h\x1b[?;h",                   // leader then separators
         "\x1b[!p\x1b[;m\x1b[0m",
+        "\x1b]0;title\x1b[" "\x07",            // ESC '[' inside OSC is an escape final
+        "\x1bPq;payload;with;semicolons\x1b\\",
+        "\x1b]8;;https://example.test/a;b;c\x07", // OSC 8 hyperlink
     };
     for (const char *sequence : benign) {
         const std::string input(sequence);
@@ -181,6 +241,7 @@ int main() {
         LibvtermMirror m;
         m.feed(input.data(), input.size());
         assert(m.oobWrites == 0);
+        checkSafe(input, "benign passthrough");
     }
 
     // Over-long CSIs collapse to 16 parameters and keep their final byte.
@@ -200,6 +261,7 @@ int main() {
             raw.feed(input.data(), input.size());
             assert(raw.oobWrites > 0);
         }
+        checkSafe(input, "semicolon parameter cap");
     }
 
     // Regression for issue #10102 comment 5995705972: ':' increments the
@@ -220,6 +282,7 @@ int main() {
             raw.feed(input.data(), input.size());
             assert(raw.oobWrites > 0);
         }
+        checkSafe(input, "colon parameter cap");
     }
 
     // A ':' before any parameter byte still increments argi because
@@ -234,38 +297,120 @@ int main() {
         LibvtermMirror m;
         m.feed(out.data(), out.size());
         assert(m.oobWrites == 0);
-        expect(out, "\x1b[:" + std::string(14, ';') + "m", "leader colon counts toward the limit");
+        expect(out, "\x1b[:" + std::string(14, ';') + "1m", "leader colon counts toward the limit");
+        checkSafe(input, "leader colon");
     }
 
-    // A long run of separators with no final byte stays suppressed and a
-    // later sequence starts fresh.
+    // Regression for issue #10336 comment 6333298078: libvterm keeps in_esc
+    // across BEL (and other non-cancelling controls), so the filter must not
+    // lose the pending ESC and miss the CSI opened by the following '['.
+    {
+        const std::string prefixes[] = {
+            std::string("\x1b\x07[", 3),  // BEL
+            std::string("\x1b\x00[", 3),  // NUL
+            std::string("\x1b\x7f[", 3),  // DEL
+            std::string("\x1b\x09[", 3),  // TAB
+            std::string("\x1b\x0a[", 3),  // LF
+            std::string("\x1b\x80[", 3),  // high byte
+            std::string("\x1b\x9b[", 3),  // raw C1 is a text byte in UTF-8 mode
+            std::string("\x1b\x1b\x07[", 4), // ESC re-arms, then BEL
+        };
+        for (const std::string &prefix : prefixes) {
+            const std::string input = prefix + std::string(20, ';') + "m";
+            LibvtermMirror raw;
+            raw.feed(input.data(), input.size());
+            assert(raw.oobWrites > 0);
+            const std::string out = filter(input);
+            expect(out, prefix + std::string(15, ';') + "m",
+                   "pending ESC survives control/high byte");
+            checkSafe(input, "pending ESC survives control/high byte");
+        }
+    }
+
+    // ESC intermediates must suppress CSI hoisting: '[' completes the escape
+    // instead of opening a sequence, so the following separators are text.
+    {
+        const char *prefixes[] = {
+            "\x1b![",   // intermediate 0x21
+            "\x1b(0[",  // two intermediates, then '[' as escape final
+        };
+        for (const char *prefix : prefixes) {
+            const std::string input = std::string(prefix) + std::string(20, ';') + "m";
+            expect(filter(input), input, "escape intermediate blocks CSI");
+            LibvtermMirror raw;
+            raw.feed(input.data(), input.size());
+            assert(raw.oobWrites == 0);
+            checkSafe(input, "escape intermediate blocks CSI");
+        }
+    }
+
+    // CAN/SUB cancel a pending escape; the following '[' is plain text.
+    {
+        const char *prefixes[] = { "\x1b\x18[", "\x1b\x1a[" };
+        for (const char *prefix : prefixes) {
+            const std::string input = std::string(prefix) + std::string(20, ';') + "m";
+            expect(filter(input), input, "CAN/SUB cancels pending escape");
+            LibvtermMirror raw;
+            raw.feed(input.data(), input.size());
+            assert(raw.oobWrites == 0);
+            checkSafe(input, "CAN/SUB cancels pending escape");
+        }
+    }
+
+    // String states never expose a CSI argument array; payload separators and
+    // an embedded ESC '[' must pass through untouched.
+    {
+        const std::string strings[] = {
+            std::string("\x1b]0;") + std::string(40, ';') + "\x07",
+            std::string("\x1b]0;title\x1b[") + std::string(40, ';') + "m\x07",
+            std::string("\x1bPq") + std::string(40, ';') + "\x1b\\",
+            "\x1bP1;2;3;4qpayload\x1b\\",
+            "\x1bXpayload\x1b\\",
+            "\x1b^payload\x1b\\",
+            "\x1b_payload\x1b\\",
+        };
+        for (const std::string &input : strings) {
+            expect(filter(input), input, "string payload passthrough");
+            LibvtermMirror raw;
+            raw.feed(input.data(), input.size());
+            assert(raw.oobWrites == 0);
+            checkSafe(input, "string payload passthrough");
+        }
+    }
+
+    // A long run of separators with no final byte stays bounded and a later
+    // sequence starts fresh.
     {
         const std::string input = "\x1b[" + std::string(200, ';') + "\x1b[0;1;38;2;1;2;3m";
         const std::string out = filter(input);
         LibvtermMirror m;
         m.feed(out.data(), out.size());
         assert(m.oobWrites == 0);
+        checkSafe(input, "unterminated over-long CSI");
     }
 
     // Chunk boundaries anywhere in the stream give the same result.
     {
-        const std::string input = "\x1b[" + std::string(40, ';') + "4m" + benign[0] + "\x1b[" + std::string(40, ':') + "m";
+        const std::string input = "\x1b\x07[" + std::string(40, ';') + "4m" + benign[0] +
+                                  "\x1b[" + std::string(40, ':') + "m" +
+                                  "\x1b]0;title\x1b[" + std::string(40, ';') + "\x07";
         const std::string whole = filter(input);
         for (size_t size = 1; size <= 7; ++size) {
             std::vector<size_t> chunks(input.size(), size);
             expect(filter(input, chunks), whole, "chunked filtering");
         }
+        checkSafe(input, "chunked filtering");
     }
 
     // Random streams: the filtered output is an ordered subsequence of the
-    // input that never trips the oracle.
+    // input, never trips the oracle, and leaves already-safe streams intact.
     std::mt19937_64 rng(0xC51EA4A8);
     const char alphabet[] = {
         '\x1b', '[', ']', 'P', 'X', '\\', ';', ':', '?', '0', '1', '9', 'm', 'h', '$',
         ' ', '!', '"', '\x07', '\x00', '\x7f', '\x18', '\x1a', '\t', '\x0a',
         '\x9b', '\x90', '\xc3', '\xa9', '\xe2', '\x80', '\x8b', '\x1b', '[', ';', ';',
     };
-    for (int iteration = 0; iteration < 500; ++iteration) {
+    for (int iteration = 0; iteration < 2000; ++iteration) {
         std::string input;
         const size_t length = 1 + rng() % 384;
         for (size_t i = 0; i < length; ++i) input.push_back(alphabet[rng() % sizeof(alphabet)]);
@@ -280,7 +425,13 @@ int main() {
         LibvtermMirror m;
         m.feed(out.data(), out.size());
         if (m.oobWrites != 0) {
-            std::fprintf(stderr, "FAIL fuzz iteration %d\n", iteration);
+            std::fprintf(stderr, "FAIL fuzz iteration %d: filtered output overflows\n", iteration);
+            return 1;
+        }
+        LibvtermMirror raw;
+        raw.feed(input.data(), input.size());
+        if (raw.oobWrites == 0 && out != input) {
+            std::fprintf(stderr, "FAIL fuzz iteration %d: safe stream was altered\n", iteration);
             return 1;
         }
     }

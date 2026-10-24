@@ -25,9 +25,9 @@ https://github.com/user-attachments/assets/897d885b-979f-4844-ae5e-6cfc77114b2a
 
 ## 安全性
 
-终端把 btop 的 PTY 输出直接送入 libvterm。libvterm 0.3.3 及更早版本在每遇到一个 `;` 时递增 CSI 参数下标而不检查数组边界（`parser.c:233-235`），而 btop 树状视图渲染进程 argv 时不转义控制字符，因此本机其他用户可以注入超过 16 个参数的序列，在本进程内越过 libvterm 的参数数组写入。
+终端把 btop 的 PTY 输出送入 libvterm。libvterm 0.3.3 及更早版本在每遇到一个 `;` 或 `:` 时递增 CSI 参数下标而不检查数组边界（`parser.c:229-235`），而 btop 树状视图渲染进程 argv 时不转义控制字符，因此本机其他用户可以注入超过 16 个参数的序列，在本进程内越过 libvterm 的参数数组写入。
 
-为此插件在 PTY 边界自行钳制参数数量（`native/CsiFilter.cpp`）：超过 16 个参数的序列在解析前被截断，其余序列逐字节无损通过。该防护不依赖系统 btop 或 libvterm 的版本，由 `tests/csi_filter.test.cpp` 覆盖。
+为此插件在 PTY 边界自行限制参数分隔符的数量（`native/CsiFilter.cpp`）。过滤器按 UTF-8 模式复刻 libvterm 的 ESC/CSI 解析：待处理的 ESC 会跨 BEL、其他 C0 控制字符、DEL 和高位字节保留，并跟踪转义中间字节，使随后的 `[` 结束转义而不是开启 CSI。只有会开启第 17 个参数的分隔符被丢弃，正文、UTF-8 和 DCS/OSC 负载均逐字节原样通过。该防护不依赖系统 btop 或 libvterm 的版本，由 `tests/csi_filter.test.cpp` 覆盖，并可接入真实 libvterm 解析器验证。
 
 ## 安装
 
@@ -111,6 +111,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 4
 omarchy plugin validate .
 g++ -std=c++17 -Wall -Wextra -Werror -o /tmp/csi_filter.test tests/csi_filter.test.cpp native/CsiFilter.cpp && /tmp/csi_filter.test
+g++ -std=c++17 -Wall -Wextra -Werror -DCSI_FILTER_WITH_VTERM -o /tmp/csi_filter-vterm.test tests/csi_filter.test.cpp native/CsiFilter.cpp $(pkg-config --cflags --libs vterm) && /tmp/csi_filter-vterm.test
 node --test tests/geometry.test.cjs
 bash tests/run-runtime.sh
 python3 tests/bridge.py

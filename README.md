@@ -23,9 +23,9 @@ https://github.com/user-attachments/assets/897d885b-979f-4844-ae5e-6cfc77114b2a
 
 ## Security
 
-The terminal pipes btop's PTY output straight into libvterm. libvterm up to 0.3.3 grows its CSI argument index on every `;` without checking the array bound (`parser.c:233-235`), and btop tree view renders process argv without escaping control characters, so another local user can inject a sequence with more than 16 parameters and write past libvterm's argument array inside this process.
+The terminal passes btop's PTY output to libvterm. libvterm up to 0.3.3 grows its CSI argument index on every `;` or `:` without checking the array bound (`parser.c:229-235`), and btop tree view renders process argv without escaping control characters, so another local user can inject a sequence with more than 16 parameters and write past libvterm's argument array inside this process.
 
-The plugin therefore clamps parameter counts at the PTY boundary itself (`native/CsiFilter.cpp`): sequences with more than 16 parameters are truncated before parsing, while every legitimate sequence passes through byte-identically. This works regardless of the installed btop or libvterm versions and is exercised by `tests/csi_filter.test.cpp`.
+The plugin therefore clamps parameter separators at the PTY boundary itself (`native/CsiFilter.cpp`). It mirrors libvterm's ESC/CSI parsing in UTF-8 mode: a pending ESC survives BEL, other C0 controls, DEL and high bytes, and escape intermediates are tracked so a following `[` completes the escape instead of opening a CSI. Only the separators that would open a seventeenth parameter are dropped; text, UTF-8 and DCS/OSC payloads pass through byte-identically. This works regardless of the installed btop or libvterm versions and is exercised by `tests/csi_filter.test.cpp`, including against the real libvterm parser.
 
 ## Install
 
@@ -105,6 +105,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 4
 omarchy plugin validate .
 g++ -std=c++17 -Wall -Wextra -Werror -o /tmp/csi_filter.test tests/csi_filter.test.cpp native/CsiFilter.cpp && /tmp/csi_filter.test
+g++ -std=c++17 -Wall -Wextra -Werror -DCSI_FILTER_WITH_VTERM -o /tmp/csi_filter-vterm.test tests/csi_filter.test.cpp native/CsiFilter.cpp $(pkg-config --cflags --libs vterm) && /tmp/csi_filter-vterm.test
 node --test tests/geometry.test.cjs
 bash tests/run-runtime.sh
 python3 tests/bridge.py

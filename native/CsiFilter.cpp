@@ -13,21 +13,24 @@ constexpr unsigned char kSub = 0x1a;
 // args[++argi] on every ';' and on every ':' - a colon is rewritten to a
 // semicolon and falls through to the same unguarded increment
 // (parser.c:229-235) - so 16 parameters stay in bounds and the separator
-// that would open a seventeenth is suppressed instead.
+// that would open a seventeenth is dropped instead.
 constexpr int kMaxParams = 16;
 
 bool isLeaderByte(unsigned char c) { return c >= 0x3c && c <= 0x3f; }
 bool isIntermediate(unsigned char c) { return c >= 0x20 && c <= 0x2f; }
-bool isFinalByte(unsigned char c) { return c >= 0x40 && c <= 0x7e; }
+bool isCsiFinalByte(unsigned char c) { return c >= 0x40 && c <= 0x7e; }
+
+// libvterm ignores NUL and DEL and executes other C0 controls inline without
+// leaving the current parser state (parser.c:143-180).
+bool isIgnoredControl(unsigned char c) {
+    return c == 0x00 || c == 0x7f || c < 0x20;
+}
 
 } // namespace
 
 void CsiFilter::reset() {
     m_state = State::Ground;
-    m_suppressing = false;
     m_separators = 0;
-    m_afterIntermediate = false;
-    m_inLeader = false;
 }
 
 size_t CsiFilter::push(char *data, size_t length) {
@@ -37,59 +40,134 @@ size_t CsiFilter::push(char *data, size_t length) {
         bool emit = true;
         switch (m_state) {
         case State::Ground:
-            // Everything passes; an ESC may begin a CSI.
+            // Everything passes; an ESC may begin a sequence.
             if (c == kEsc) m_state = State::Escape;
             break;
         case State::Escape:
-            // '[' is hoisted to C1 CSI by libvterm (parser.c:185-196).
-            // A bare ESC re-arms instead of ending anything.
+            // CAN/SUB cancel a pending escape; a bare ESC re-arms it
+            // (parser.c:152-162).
+            if (c == kEsc) break;
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (isIgnoredControl(c)) break;
+            if (isIntermediate(c)) { m_state = State::EscapeIntermediate; break; }
             if (c == '[') {
-                m_state = State::Csi;
-                m_suppressing = false;
+                // Hoisted to C1 CSI (parser.c:185-196).
+                m_state = State::CsiLeader;
                 m_separators = 0;
-                m_afterIntermediate = false;
-                m_inLeader = true;
-            } else if (c != kEsc) {
+                break;
+            }
+            if (c >= 0x40 && c <= 0x5f) {
+                // Remaining ESC letters in this range become C1 controls.
+                if (c == 'P') m_state = State::DcsCommand;
+                else if (c == ']') m_state = State::OscCommand;
+                else if (c == 'X' || c == '^' || c == '_') m_state = State::String;
+                else m_state = State::Ground;
+                break;
+            }
+            if (c >= 0x30 && c <= 0x7e) {
+                // 0x30-0x3f and 0x60-0x7e are two-character escapes.
                 m_state = State::Ground;
             }
+            // Bytes >= 0x80 leave in_esc armed (parser.c:316).
             break;
-        case State::Csi:
-            if (c == kEsc) {
-                // ESC cancels the sequence and is reprocessed (parser.c:159).
-                m_state = State::Escape;
-            } else if (c == kCan || c == kSub) {
-                m_state = State::Ground;
-            } else if (c == ';' || c == ':') {
+        case State::EscapeIntermediate:
+            // Once ESC has intermediates, '[' completes the escape rather
+            // than opening a CSI (parser.c:185-196).
+            if (c == kEsc) { m_state = State::Escape; break; }
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (isIgnoredControl(c)) break;
+            if (isIntermediate(c)) break;
+            if (c >= 0x30 && c <= 0x7e) m_state = State::Ground;
+            // Bytes >= 0x80 keep in_esc armed.
+            break;
+        case State::CsiLeader:
+            if (c == kEsc) { m_state = State::Escape; break; }
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (isIgnoredControl(c)) break;
+            if (isLeaderByte(c)) break;
+            // The first non-leader byte ends the leader and is reprocessed
+            // as a parameter byte (parser.c:204-217).
+            m_state = State::CsiArgs;
+            m_separators = 0;
+            [[fallthrough]];
+        case State::CsiArgs:
+            if (c == kEsc) { m_state = State::Escape; break; }
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (isIgnoredControl(c)) break;
+            if (c == ';' || c == ':') {
                 // libvterm rewrites ':' to ';' and falls through to the same
                 // argi++ write (parser.c:229-235), so both count identically.
-                if (m_afterIntermediate) m_state = State::Ground; // invalid there, argi frozen
-                else if (m_suppressing) emit = false;
-                else if (m_separators >= kMaxParams - 1) { m_suppressing = true; emit = false; }
-                else { ++m_separators; m_inLeader = false; }
-            } else if (c >= '0' && c <= '9') {
-                if (m_afterIntermediate) m_state = State::Ground;
-                else { m_inLeader = false; if (m_suppressing) emit = false; }
-            } else if (isLeaderByte(c)) {
-                if (m_inLeader) break; // still accumulating the leader
-                // Leader bytes after parameters started are invalid.
-                if (m_suppressing) emit = false;
-                m_state = State::Ground;
-            } else if (isIntermediate(c)) {
-                m_afterIntermediate = true;
-                m_inLeader = false;
-                if (m_suppressing) emit = false;
-            } else if (isFinalByte(c)) {
-                // Dispatch happens now with at most kMaxParams arguments;
-                // forwarding it leaves libvterm's parser in a clean state.
-                m_state = State::Ground;
-            } else if (c == 0x00 || c == 0x7f || c < 0x20) {
-                // NUL/DEL are ignored and other C0 controls are executed
-                // inline without ending the sequence (parser.c:143-180).
-            } else {
-                // Any other byte invalidates the sequence (parser.c:256).
-                if (m_suppressing) emit = false;
-                m_state = State::Ground;
+                // Dropping the separator keeps argi at the cap; later
+                // separators are dropped the same way.
+                if (m_separators >= kMaxParams - 1) emit = false;
+                else ++m_separators;
+                break;
             }
+            if (c >= '0' && c <= '9') break;
+            if (isLeaderByte(c)) { m_state = State::Ground; break; }
+            if (isIntermediate(c)) { m_state = State::CsiIntermed; break; }
+            if (isCsiFinalByte(c)) { m_state = State::Ground; break; }
+            // Any other byte invalidates the sequence (parser.c:240-258).
+            m_state = State::Ground;
+            break;
+        case State::CsiIntermed:
+            if (c == kEsc) { m_state = State::Escape; break; }
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (isIgnoredControl(c)) break;
+            if (isIntermediate(c)) break;
+            // A final byte dispatches, anything else is invalid; both resume
+            // in the ground state (parser.c:243-258).
+            m_state = State::Ground;
+            break;
+        case State::DcsCommand:
+            // DCS_COMMAND is not a string state: ESC returns to NORMAL with
+            // in_esc armed, while C0 controls are executed inline.
+            if (c == kEsc) { m_state = State::Escape; break; }
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (isIgnoredControl(c)) break;
+            if (isCsiFinalByte(c)) m_state = State::String; // DCS payload
+            // Every other byte stays in the bounded command array.
+            break;
+        case State::OscCommand:
+            // OSC_COMMAND is a string state: ESC keeps it armed, BEL ends it.
+            if (c == kEsc) { m_state = State::StringEscape; break; }
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (isIgnoredControl(c)) {
+                if (c == 0x07) m_state = State::Ground; // BEL acts as ST
+                break;
+            }
+            if (c >= '0' && c <= '9') break;
+            // ';' or any other byte starts the OSC payload (parser.c:261-281).
+            m_state = State::String;
+            break;
+        case State::String:
+            if (c == kEsc) { m_state = State::StringEscape; break; }
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (isIgnoredControl(c)) {
+                if (c == 0x07) m_state = State::Ground; // BEL acts as ST
+                break;
+            }
+            // Payload bytes are unbounded strings inside libvterm.
+            break;
+        case State::StringEscape:
+            if (c == kEsc) break; // re-arm, still inside the string
+            if (c == kCan || c == kSub) { m_state = State::Ground; break; }
+            if (c == 0x00 || c == 0x7f) break;
+            if (c == '\\') { m_state = State::Ground; break; } // ST terminates
+            if (c < 0x20) {
+                // Other C0 controls abandon the string state and leave ESC
+                // armed in NORMAL (parser.c:166-180, 185-200).
+                m_state = State::Escape;
+                break;
+            }
+            if (isIntermediate(c)) { m_state = State::EscapeIntermediate; break; }
+            if (c >= 0x30 && c <= 0x7e) {
+                // The escape completes; '[' is an escape final here, not CSI.
+                m_state = State::Ground;
+                break;
+            }
+            // Bytes >= 0x80 leave ESC armed in NORMAL.
+            m_state = State::Escape;
             break;
         }
         if (emit) data[out++] = data[in];
