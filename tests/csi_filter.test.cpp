@@ -378,6 +378,28 @@ int main() {
         }
     }
 
+    // Regression for issue #10336 comment 6402925863: a non-terminating C0
+    // after ESC inside OSC must preserve both OSC and the parser's pending ESC.
+    // The following ESC '[' is consequently still OSC content, while a later
+    // fresh CSI is bounded normally. Exercise every split around the state
+    // transition because PTY reads can divide this sequence at any byte.
+    {
+        const std::string input = std::string("\x1b]0;title\x1b\x01\x1b[") +
+                                  std::string(20, ';') + "\x07" +
+                                  "\x1b[" + std::string(20, ';') + "m";
+        const std::string expected = std::string("\x1b]0;title\x1b\x01\x1b[") +
+                                     std::string(20, ';') + "\x07" +
+                                     "\x1b[" + std::string(15, ';') + "m";
+        expect(filter(input), expected, "OSC and pending ESC survive C0");
+        LibvtermMirror raw;
+        raw.feed(input.data(), input.size());
+        assert(raw.oobWrites > 0); // the final, unfiltered CSI is intentionally overlong
+        checkSafe(input, "OSC and pending ESC survive C0");
+        for (size_t split = 1; split < input.size(); ++split) {
+            expect(filter(input, {split}), expected, "OSC C0 split boundary");
+        }
+    }
+
     // A long run of separators with no final byte stays bounded and a later
     // sequence starts fresh.
     {

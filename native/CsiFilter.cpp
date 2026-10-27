@@ -155,9 +155,12 @@ size_t CsiFilter::push(char *data, size_t length) {
             if (c == 0x00 || c == 0x7f) break;
             if (c == '\\') { m_state = State::Ground; break; } // ST terminates
             if (c < 0x20) {
-                // Other C0 controls abandon the string state and leave ESC
-                // armed in NORMAL (parser.c:166-180, 185-200).
-                m_state = State::Escape;
+                // Non-terminating C0 controls execute inline while libvterm
+                // retains both the string state and its pending in_esc flag
+                // (parser.c:158-166). BEL terminates the string; because the
+                // parser still processes the pending ESC first, it leaves the
+                // parser in NORMAL with in_esc armed.
+                if (c == 0x07) m_state = State::Escape;
                 break;
             }
             if (isIntermediate(c)) { m_state = State::EscapeIntermediate; break; }
